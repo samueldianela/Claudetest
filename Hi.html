@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<meta name="theme-color" content="#05060a" />
+<meta name="description" content="A physical simulation of sunlight specularly reflecting off your screen, driven by the device gyroscope." />
+<title>Sun on Glass — Gyroscope Specular Reflection</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #05060a; color: #dfe6f5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    touch-action: none;
+  }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  .hud {
+    position: fixed;
+    left: max(16px, env(safe-area-inset-left));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    font-size: 11px;
+    letter-spacing: .08em;
+    line-height: 1.75;
+    text-transform: uppercase;
+    color: rgba(190, 208, 235, .45);
+    pointer-events: none;
+    text-shadow: 0 1px 8px rgba(0,0,0,.8);
+    transition: opacity .4s ease;
+  }
+  .hud .title {
+    font-size: 9px;
+    letter-spacing: .28em;
+    color: rgba(255, 240, 205, .55);
+    margin-bottom: 2px;
+  }
+  .hud b {
+    color: rgba(255, 236, 196, .92);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #enable {
+    position: fixed;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    padding: 16px 26px;
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: #ffe9bd;
+    background: rgba(255, 220, 150, .07);
+    border: 1px solid rgba(255, 220, 150, .32);
+    border-radius: 999px;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 0 40px rgba(255, 190, 90, .18), inset 0 0 24px rgba(255, 210, 130, .06);
+    cursor: pointer;
+    transition: background .25s, box-shadow .25s, transform .15s;
+  }
+  #enable:hover {
+    background: rgba(255, 220, 150, .14);
+    box-shadow: 0 0 60px rgba(255, 190, 90, .3), inset 0 0 24px rgba(255, 210, 130, .12);
+  }
+  #enable:active { transform: translate(-50%, -50%) scale(.97); }
+  #enable[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<canvas id="scene"></canvas>
+
+<div class="hud" id="hud">
+  <div class="title">Sun · Reflection</div>
+  <div>α <b id="va">–</b> &nbsp; β <b id="vb">–</b> &nbsp; γ <b id="vg">–</b></div>
+  <div>source <b id="vsrc">demo</b></div>
+</div>
+
+<button id="enable" hidden>☀ Enable gyroscope</button>
+
+<script>
+(() => {
+  'use strict';
+
+  const D2R = Math.PI / 180;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const smoothstep = (e0, e1, x) => {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+
+  const canvas = document.getElementById('scene');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const elA = document.getElementById('va');
+  const elB = document.getElementById('vb');
+  const elG = document.getElementById('vg');
+  const elSrc = document.getElementById('vsrc');
+  const btn = document.getElementById('enable');
+
+  let W = 1, H = 1, DPR = 1;
+  let bgGrad = null, vigGrad = null, grain = null;
+
+  /* ------------------------------------------------------------------ *
+   *  State
+   * ------------------------------------------------------------------ */
+  const state = {
+    alpha: null, beta: null, gamma: null,   // raw sensor values (degrees)
+    sensor: false,                          // gyroscope is feeding us data
+    pointer: false,                         // fallback: pointer drives the sun
+    x: 0.5, y: 0.5, i: 0,                   // smoothed glare position + intensity
+    tx: 0.5, ty: 0.5, ti: 0,                // targets
+  };
+
+  /* ------------------------------------------------------------------ *
+   *  Sizing & cached gradients
+   * ------------------------------------------------------------------ */
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = canvas.clientWidth || window.innerWidth;
+    H = canvas.clientHeight || window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    bgGrad = ctx.createRadialGradient(W * 0.5, H * 0.42, 0, W * 0.5, H * 0.5, Math.max(W, H) * 0.85);
+    bgGrad.addColorStop(0.00, '#0f1420');
+    bgGrad.addColorStop(0.55, '#090b12');
+    bgGrad.addColorStop(1.00, '#04050a');
+
+    vigGrad = ctx.createRadialGradient(
+      W * 0.5, H * 0.5, Math.min(W, H) * 0.30,
+      W * 0.5, H * 0.5, Math.max(W, H) * 0.78
+    );
+    vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+    vigGrad.addColorStop(1, 'rgba(0,0,0,0.62)');
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Film grain (generated once, tiled)
+   * ------------------------------------------------------------------ */
+  function makeGrain() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const img = g.createImageData(128, 128);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = 112 + Math.random() * 90;
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    grain = ctx.createPattern(c, 'repeat');
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Sensor → glare geometry
+   *
+   *  The device→earth rotation matrix R is (W3C DeviceOrientation spec):
+   *
+   *    R = Rz(alpha) · Rx(beta) · Ry(gamma)
+   *
+   *  With the sun assumed to sit directly overhead in the earth frame,
+   *  its direction expressed in device coordinates is Rᵀ·(0,0,1) —
+   *  which is simply the 3rd row of R.  Alpha drops out entirely,
+   *  so no compass / absolute orientation is required.
+   *
+   *  Device axes:  x → right of screen,  y → top of screen,  z → out of screen.
+   *  A distant light reflected off the flat screen reaches the eye when
+   *  the mirror direction matches the eye direction, so the glare offset
+   *  from the screen centre scales with (dx/dz, dy/dz).
+   * ------------------------------------------------------------------ */
+  function computeFromOrientation() {
+    const B = (state.beta || 0) * D2R;
+    const C = (state.gamma || 0) * D2R;
+
+    const sB = Math.sin(B), cB = Math.cos(B);
+    const sC = Math.sin(C), cC = Math.cos(C);
+
+    const dx = -cB * sC;   // R[2][0]
+    const dy =  sB;        // R[2][1]
+    const dz =  cB * cC;   // R[2][2]
+
+    const denom = Math.max(dz, 0.22);   // soften the grazing-angle singularity
+    const SENS = 0.5;
+
+    state.tx = clamp(0.5 + SENS * dx / denom, -0.8, 1.8);
+    state.ty = clamp(0.5 - SENS * dy / denom, -0.8, 1.8);
+    state.ti = smoothstep(0.02, 0.55, dz);
+  }
+
+  function onOrientation(e) {
+    if (e.beta === null && e.gamma === null) return;
+    state.alpha = e.alpha;
+    state.beta = e.beta || 0;
+    state.gamma = e.gamma || 0;
+    if (!state.sensor) {
+      state.sensor = true;
+      state.pointer = false;
+    }
+    computeFromOrientation();
+  }
+
+  function attachSensor() {
+    window.addEventListener('deviceorientation', onOrientation, true);
+    if ('ondeviceorientationabsolute' in window) {
+      window.addEventListener('deviceorientationabsolute', onOrientation, true);
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Permission flow (iOS 13+ requires an explicit user gesture)
+   * ------------------------------------------------------------------ */
+  const needsPermission =
+    typeof DeviceOrientationEvent !== 'undefined' &&
+    typeof DeviceOrientationEvent.requestPermission === 'function';
+
+  if (needsPermission) {
+    btn.hidden = false;
+  } else {
+    attachSensor();
+  }
+
+  btn.addEventListener('click', async () => {
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res === 'granted') {
+        attachSensor();
+        btn.hidden = true;
+      } else {
+        btn.textContent = 'Permission denied — tap to retry';
+      }
+    } catch (err) {
+      btn.textContent = 'Sensor unavailable — use touch';
+      btn.hidden = true;
+    }
+  });
+
+  /* ------------------------------------------------------------------ *
+   *  Pointer fallback (desktop / no-gyro devices)
+   * ------------------------------------------------------------------ */
+  function onPointer(e) {
+    if (state.sensor) return;
+    state.pointer = true;
+    state.tx = e.clientX / W;
+    state.ty = e.clientY / H;
+    state.ti = 1;
+  }
+  window.addEventListener('pointermove', onPointer, { passive: true });
+  window.addEventListener('pointerdown', onPointer, { passive: true });
+
+  /* ------------------------------------------------------------------ *
+   *  Simulation step
+   * ------------------------------------------------------------------ */
+  function step(now, dt) {
+    // Idle demo: gently sweep a Lissajous path so the page looks alive.
+    if (!state.sensor && !state.pointer) {
+      const t = now * 0.001;
+      state.tx = 0.5 + 0.30 * Math.sin(t * 0.62);
+      state.ty = 0.5 + 0.22 * Math.sin(t * 0.97 + 1.1);
+      state.ti = 0.85;
+    }
+
+    // Exponential smoothing — frame-rate independent.
+    const k = 1 - Math.exp(-dt / 0.075);
+    state.x += (state.tx - state.x) * k;
+    state.y += (state.ty - state.y) * k;
+    state.i += (state.ti - state.i) * k;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Rendering
+   * ------------------------------------------------------------------ */
+  function drawSheen() {
+    const ox = (state.x - 0.5) * W * 0.35;
+    const oy = (state.y - 0.5) * H * 0.35;
+
+    ctx.save();
+    ctx.translate(ox, oy);
+    const g = ctx.createLinearGradient(-W * 0.3, -H * 0.2, W * 1.1, H * 1.1);
+    g.addColorStop(0.00, 'rgba(140,170,255,0)');
+    g.addColorStop(0.42, 'rgba(140,170,255,0.012)');
+    g.addColorStop(0.50, 'rgba(195,218,255,0.050)');
+    g.addColorStop(0.58, 'rgba(140,170,255,0.012)');
+    g.addColorStop(1.00, 'rgba(140,170,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(-W, -H, W * 3, H * 3);
+    ctx.restore();
+  }
+
+  function drawFlare(cx, cy, k) {
+    if (k <= 0.003) return;
+
+    const unit = Math.min(W, H);
+    const R = Math.max(W, H);
+
+    /* --- wide ambient bloom ------------------------------------------ */
+    let g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.75);
+    g.addColorStop(0.00, `rgba(255,244,214,${0.40 * k})`);
+    g.addColorStop(0.08, `rgba(255,214,150,${0.20 * k})`);
+    g.addColorStop(0.26, `rgba(255,158,78,${0.075 * k})`);
+    g.addColorStop(0.60, `rgba(255,120,48,${0.022 * k})`);
+    g.addColorStop(1.00, 'rgba(255,90,20,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    /* --- hot core ----------------------------------------------------- */
+    const core = unit * 0.14;
+    g = ctx.createRadialGradient(cx, cy, 0, cx, cy, core);
+    g.addColorStop(0.00, `rgba(255,255,255,${0.95 * k})`);
+    g.addColorStop(0.18, `rgba(255,252,236,${0.72 * k})`);
+    g.addColorStop(0.45, `rgba(255,226,168,${0.22 * k})`);
+    g.addColorStop(1.00, 'rgba(255,200,120,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, core, 0, Math.PI * 2);
+    ctx.fill();
+
+    /* --- anamorphic streak (horizontal) -------------------------------- */
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(9, 1);
+    const sr = unit * 0.13;
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, sr);
+    g.addColorStop(0.00, `rgba(214,234,255,${0.34 * k})`);
+    g.addColorStop(0.35, `rgba(150,196,255,${0.10 * k})`);
+    g.addColorStop(1.00, 'rgba(90,150,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, sr, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    /* --- anamorphic streak (vertical, shorter) ------------------------- */
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(1, 3.2);
+    const vr = unit * 0.09;
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, vr);
+    g.addColorStop(0.00, `rgba(255,240,214,${0.30 * k})`);
+    g.addColorStop(0.40, `rgba(255,200,140,${0.08 * k})`);
+    g.addColorStop(1.00, 'rgba(255,160,80,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, vr, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    /* --- spectral halo ------------------------------------------------ */
+    const hr = unit * 0.32;
+    g = ctx.createRadialGradient(cx, cy, hr * 0.82, cx, cy, hr * 1.18);
+    g.addColorStop(0.0, 'rgba(120,200,255,0)');
+    g.addColorStop(0.5, `rgba(160,220,255,${0.055 * k})`);
+    g.addColorStop(1.0, 'rgba(180,140,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, hr * 1.18, 0, Math.PI * 2); ctx.fill();
+
+    /* --- lens ghosts along the centre→flare axis ----------------------- */
+    const dx = cx - W / 2;
+    const dy = cy - H / 2;
+    const ghosts = [
+      { t: -0.62, r: 0.060, h: 195, a: 0.10 },
+      { t: -0.30, r: 0.030, h: 45,  a: 0.16 },
+      { t:  0.28, r: 0.085, h: 150, a: 0.07 },
+      { t:  0.58, r: 0.042, h: 285, a: 0.10 },
+      { t:  1.05, r: 0.120, h: 20,  a: 0.05 },
+      { t:  1.42, r: 0.058, h: 200, a: 0.08 },
+    ];
+
+    for (let n = 0; n < ghosts.length; n++) {
+      const gh = ghosts[n];
+      const gx = W / 2 + dx * gh.t;
+      const gy = H / 2 + dy * gh.t;
+      const r = unit * gh.r;
+      const gg = ctx.createRadialGradient(gx, gy, r * 0.22, gx, gy, r);
+      gg.addColorStop(0.00, `hsla(${gh.h},90%,72%,${gh.a * k})`);
+      gg.addColorStop(0.72, `hsla(${gh.h},90%,62%,${gh.a * 0.35 * k})`);
+      gg.addColorStop(1.00, `hsla(${gh.h},90%,55%,0)`);
+      ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(gx, gy, r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function draw(now) {
+    /* background ------------------------------------------------------- */
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    /* glass sheen ------------------------------------------------------ */
+    drawSheen();
+
+    /* specular flare --------------------------------------------------- */
+    ctx.globalCompositeOperation = 'lighter';
+    drawFlare(state.x * W, state.y * H, state.i);
+
+    /* vignette --------------------------------------------------------- */
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = vigGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    /* film grain ------------------------------------------------------- */
+    if (grain) {
+      ctx.globalCompositeOperation = 'overlay';
+      ctx.globalAlpha = 0.12;
+      const ox = (now * 0.06) % 128;
+      const oy = (now * 0.09) % 128;
+      ctx.save();
+      ctx.translate(-ox, -oy);
+      ctx.fillStyle = grain;
+      ctx.fillRect(0, 0, W + 128, H + 128);
+      ctx.restore();
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  HUD
+   * ------------------------------------------------------------------ */
+  let hudAcc = 0;
+  function updateHud() {
+    const fmt = (v) => (v === null || v === undefined ? '–' : v.toFixed(1));
+    elA.textContent = fmt(state.alpha);
+    elB.textContent = fmt(state.beta);
+    elG.textContent = fmt(state.gamma);
+    elSrc.textContent = state.sensor ? 'gyroscope' : (state.pointer ? 'pointer' : 'demo');
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Main loop
+   * ------------------------------------------------------------------ */
+  let last = performance.now();
+
+  function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+
+    step(now, dt);
+    draw(now);
+
+    hudAcc += dt;
+    if (hudAcc > 0.1) { hudAcc = 0; updateHud(); }
+
+    requestAnimationFrame(loop);
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Boot
+   * ------------------------------------------------------------------ */
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 120));
+  window.addEventListener('visibilitychange', () => { last = performance.now(); });
+
+  resize();
+  makeGrain();
+  updateHud();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
