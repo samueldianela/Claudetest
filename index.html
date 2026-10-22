@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glare – tilt your phone to catch the sun</title>
+<style>
+  :root { --ink:#f6e9d2; --dim:#a79b88; --bg:#0c0e18; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden;
+    font-family: ui-rounded, "Avenir Next", system-ui, -apple-system, "Segoe UI", sans-serif;
+    color:var(--ink); -webkit-user-select:none; user-select:none; touch-action:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #intro { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; padding:24px; text-align:center;
+    background:rgba(8,9,16,.78); backdrop-filter: blur(6px); z-index:3; }
+  #intro h1 { font-size:clamp(2.2rem,9vw,3.6rem); font-weight:600; margin:0; letter-spacing:-.02em; }
+  #intro p { margin:0; max-width:28ch; color:var(--dim); line-height:1.5; }
+  button { font:inherit; color:#1b1406; background:#ffd98a; border:0; border-radius:999px;
+    padding:14px 26px; font-weight:600; cursor:pointer; }
+  button:focus-visible { outline:3px solid #fff; outline-offset:3px; }
+  #hud { position:fixed; left:0; right:0; bottom:0; z-index:2; display:flex; justify-content:space-between;
+    align-items:center; gap:12px; padding:14px 18px calc(14px + env(safe-area-inset-bottom,0px));
+    font-size:.8rem; color:var(--dim); font-variant-numeric:tabular-nums; }
+  #hud button { padding:8px 16px; font-size:.8rem; background:rgba(255,217,138,.16); color:var(--ink); }
+  #status { position:fixed; top:calc(14px + env(safe-area-inset-top,0px)); left:0; right:0; text-align:center;
+    z-index:2; font-size:.85rem; color:var(--dim); pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status"></div>
+<div id="hud" hidden>
+  <span id="readout">α 0° β 0° γ 0°</span>
+  <button id="reset" type="button">Reset sun</button>
+</div>
+<div id="intro">
+  <h1>Glare</h1>
+  <p>Tilt your phone and the sun slides across the glass.</p>
+  <button id="start" type="button">Enable motion sensors</button>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const intro = document.getElementById('intro'), hud = document.getElementById('hud');
+  const readout = document.getElementById('readout'), statusEl = document.getElementById('status');
+  const rad = Math.PI / 180;
+
+  // Sun in the world: azimuth relative to where the phone points at start, elevation above horizon.
+  const SUN_EL = 50 * rad;
+  let alphaOffset = null;
+  let ori = { a: 0, b: 0, g: 0 };
+  let usingSensor = false;
+  let pointer = { x: .5, y: .5 };
+  let s = { x: 0, y: .6, z: .8 };            // smoothed sun direction in device frame
+  let W = 0, H = 0, dust, glare, gctx;
+
+  // ---------- canvas + dust layer (what the sunlight catches) ----------
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    W = cv.width = Math.round(innerWidth * dpr);
+    H = cv.height = Math.round(innerHeight * dpr);
+    dust = document.createElement('canvas'); dust.width = W; dust.height = H;
+    glare = document.createElement('canvas'); glare.width = W; glare.height = H;
+    gctx = glare.getContext('2d');
+    const d = dust.getContext('2d'), u = Math.min(W, H) / 400;
+    for (let i = 0; i < 2600; i++) {                       // fine dust
+      d.fillStyle = `rgba(255,255,255,${.15 + Math.random() * .85})`;
+      const r = (.4 + Math.random() * 1.1) * u;
+      d.beginPath(); d.arc(Math.random() * W, Math.random() * H, r, 0, 6.3); d.fill();
+    }
+    d.lineCap = 'round';
+    for (let i = 0; i < 70; i++) {                         // hairline scratches
+      d.strokeStyle = `rgba(255,255,255,${.25 + Math.random() * .6})`;
+      d.lineWidth = .6 * u;
+      const x = Math.random() * W, y = Math.random() * H, a = Math.random() * 6.3, l = (10 + Math.random() * 50) * u;
+      d.beginPath(); d.moveTo(x, y); d.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); d.stroke();
+    }
+    for (let i = 0; i < 9; i++) {                          // finger smudges
+      const x = Math.random() * W, y = Math.random() * H, r = (30 + Math.random() * 60) * u;
+      const g = d.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, 'rgba(255,255,255,.35)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      d.fillStyle = g; d.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------- sensors ----------
+  function onOrient(e) {
+    if (e.alpha == null && e.beta == null) return;
+    usingSensor = true;
+    const a = e.webkitCompassHeading != null ? 360 - e.webkitCompassHeading : (e.alpha || 0);
+    if (alphaOffset === null) alphaOffset = a;
+    ori = { a: a - alphaOffset, b: e.beta || 0, g: e.gamma || 0 };
+  }
+  async function start() {
+    intro.hidden = true; hud.hidden = false;
+    try {
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const res = await DeviceOrientationEvent.requestPermission();
+        if (res !== 'granted') throw new Error('denied');
+      }
+      addEventListener('deviceorientation', onOrient);
+    } catch (err) {
+      statusEl.textContent = 'Motion access was denied. Move your finger or mouse instead.';
+    }
+    setTimeout(() => {
+      if (!usingSensor) statusEl.textContent = statusEl.textContent || 'No motion sensor found. Move your pointer to tilt the glass.';
+    }, 1500);
+    setTimeout(() => statusEl.textContent = '', 6000);
+  }
+  document.getElementById('start').addEventListener('click', start);
+  document.getElementById('reset').addEventListener('click', () => { alphaOffset = null; });
+  addEventListener('pointermove', e => { pointer = { x: e.clientX / innerWidth, y: e.clientY / innerHeight }; });
+
+  // ---------- math: sun direction in the device's own frame ----------
+  function sunInDevice(a, b, g) {
+    // world sun vector (X east, Y north, Z up), azimuth 0 = initial heading
+    let x = 0, y = Math.cos(SUN_EL), z = Math.sin(SUN_EL);
+    a *= rad; b *= rad; g *= rad;
+    // R^T = Ry(-g) · Rx(-b) · Rz(-a)
+    let x1 = x * Math.cos(a) + y * Math.sin(a), y1 = -x * Math.sin(a) + y * Math.cos(a), z1 = z;
+    let y2 = y1 * Math.cos(b) + z1 * Math.sin(b), z2 = -y1 * Math.sin(b) + z1 * Math.cos(b);
+    let x3 = x1 * Math.cos(g) - z2 * Math.sin(g), z3 = x1 * Math.sin(g) + z2 * Math.cos(g);
+    return { x: x3, y: y2, z: z3 };
+  }
+  const smooth = (t, lo, hi) => { t = Math.min(1, Math.max(0, (t - lo) / (hi - lo))); return t * t * (3 - 2 * t); };
+
+  // ---------- render ----------
+  function frame() {
+    const o = usingSensor ? ori : { a: 0, b: (pointer.y - .5) * 100, g: (pointer.x - .5) * 100 };
+    const t = sunInDevice(o.a, o.b, o.g), k = .18;
+    s.x += (t.x - s.x) * k; s.y += (t.y - s.y) * k; s.z += (t.z - s.z) * k;
+    readout.textContent = `α ${o.a.toFixed(0)}°  β ${o.b.toFixed(0)}°  γ ${o.g.toFixed(0)}°`;
+
+    const cx = W / 2, cy = H / 2, reach = Math.max(W, H) * .95;
+    const gx = cx + s.x * reach, gy = cy - s.y * reach;
+    const I = smooth(s.z, -.05, .85);                       // 0 = sun behind the phone, 1 = straight on
+    const R = Math.max(W, H);
+
+    // dark glass with a slow sheen that follows the tilt
+    const bg = ctx.createLinearGradient(0, 0, W, H);
+    bg.addColorStop(0, '#0b0d17'); bg.addColorStop(1, '#1a1420');
+    ctx.globalCompositeOperation = 'source-over'; ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    const sh = ctx.createLinearGradient(gx - R * .4, gy - R * .4, gx + R * .4, gy + R * .4);
+    sh.addColorStop(0, 'rgba(255,255,255,0)'); sh.addColorStop(.5, `rgba(255,214,150,${.06 * I})`); sh.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = sh; ctx.fillRect(0, 0, W, H);
+
+    // light the dust: glare gradient masked by the dust layer
+    gctx.globalCompositeOperation = 'source-over'; gctx.clearRect(0, 0, W, H);
+    let g = gctx.createRadialGradient(gx, gy, 0, gx, gy, R * .75);
+    g.addColorStop(0, `rgba(255,244,214,${I})`); g.addColorStop(.35, `rgba(255,196,120,${.55 * I})`); g.addColorStop(1, 'rgba(255,160,80,0)');
+    gctx.fillStyle = g; gctx.fillRect(0, 0, W, H);
+    gctx.globalCompositeOperation = 'destination-in'; gctx.drawImage(dust, 0, 0);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(glare, 0, 0); ctx.drawImage(glare, 0, 0);
+
+    // bloom + core
+    ctx.fillStyle = `rgba(255,190,110,${.10 * I})`; ctx.fillRect(0, 0, W, H);
+    g = ctx.createRadialGradient(gx, gy, 0, gx, gy, R * .5);
+    g.addColorStop(0, `rgba(255,255,248,${.95 * I})`); g.addColorStop(.08, `rgba(255,240,200,${.8 * I})`);
+    g.addColorStop(.3, `rgba(255,185,100,${.28 * I})`); g.addColorStop(1, 'rgba(255,140,60,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    // anamorphic streak
+    ctx.save(); ctx.translate(gx, gy); ctx.scale(1, .035);
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, R * .8);
+    g.addColorStop(0, `rgba(255,230,180,${.7 * I})`); g.addColorStop(1, 'rgba(255,200,140,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, R * .8, 0, 6.3); ctx.fill(); ctx.restore();
+
+    // lens ghosts along the line through the screen centre
+    [[-.35, .06, '255,170,90'], [-.7, .11, '140,200,255'], [-1.1, .04, '255,120,120'], [-1.6, .16, '255,220,150']]
+      .forEach(([m, r, c]) => {
+        const px = cx + (gx - cx) * m, py = cy + (gy - cy) * m, rr = R * r;
+        const gg = ctx.createRadialGradient(px, py, rr * .6, px, py, rr);
+        gg.addColorStop(0, `rgba(${c},0)`); gg.addColorStop(.85, `rgba(${c},${.13 * I})`); gg.addColorStop(1, `rgba(${c},0)`);
+        ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(px, py, rr, 0, 6.3); ctx.fill();
+      });
+
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
